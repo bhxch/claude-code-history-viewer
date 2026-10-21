@@ -711,7 +711,7 @@ fn extract_session_metadata_internal(
 }
 
 /// Message types that should always be excluded from the viewer
-const EXCLUDED_MESSAGE_TYPES: [&str; 7] = [
+const EXCLUDED_MESSAGE_TYPES: [&str; 11] = [
     "progress",
     "queue-operation",
     "file-history-snapshot",
@@ -722,6 +722,20 @@ const EXCLUDED_MESSAGE_TYPES: [&str; 7] = [
     "agent-name",
     // Claude Code's auto-generated session title; used as the session name, not a message.
     "ai-title",
+    // The context the client injects into a turn: hook output, system-reminders,
+    // CLAUDE.md contents, environment and model info. It is not something the
+    // user said or the assistant replied, so it stays out of the transcript.
+    "attachment",
+    // The request the client sent (Claude Code 2.1.302+):
+    //   - "api-request"      - the request's metadata (model, params, cache refs)
+    //   - "api-request-blob" - the request's message array, which repeats the
+    //                          injected context as a `role: "system"` message
+    //   - "api-request-shape"- the request shape, carrying the full system prompt
+    // These describe the API call, not the conversation, and the blob's copy of
+    // the injected context rendered as raw text in the transcript.
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
 ];
 
 /// System subtypes that are internal metadata (excluded from the viewer).
@@ -4599,5 +4613,63 @@ mod tests {
         assert_eq!(session_lines(BufReader::new(Unreadable)).count(), 0);
         let mixed: &[u8] = b"one\n\xff\ntwo\n";
         assert_eq!(session_lines(mixed).collect::<Vec<_>>(), ["one", "two"]);
+    }
+
+    /// The context the client injects into a turn is not part of the
+    /// conversation, so it stays out of the transcript.
+    #[test]
+    fn test_attachment_records_are_hidden_from_the_viewer() {
+        assert!(!is_viewer_visible_line(
+            "attachment",
+            None,
+            None,
+            None,
+            false
+        ));
+    }
+
+    /// The API-layer records describe the request the client sent, not the
+    /// conversation. The blob's copy of the injected context rendered as raw
+    /// text in the transcript, which is what this keeps out.
+    #[test]
+    fn test_api_request_records_are_hidden_from_the_viewer() {
+        for message_type in ["api-request", "api-request-blob", "api-request-shape"] {
+            assert!(
+                !is_viewer_visible_line(message_type, None, None, None, false),
+                "{message_type} should not be visible in the viewer"
+            );
+        }
+    }
+
+    /// A real message still reaches the viewer.
+    #[test]
+    fn test_conversation_messages_stay_visible() {
+        assert!(is_viewer_visible_line("user", None, None, None, false));
+        assert!(is_viewer_visible_line("assistant", None, None, None, false));
+    }
+
+    /// The excluded records do not count towards a session's message count
+    /// either: they are client bookkeeping, not messages.
+    #[tokio::test]
+    async fn test_excluded_records_are_not_counted_as_messages() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let content = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            create_sample_user_message("uuid-1", "session-1", "Hello"),
+            create_sample_assistant_message("uuid-2", "session-1", "Hi there!"),
+            r#"{"type":"attachment","attachment":{"type":"total_tokens_reminder"},"rendered":[{"content":"<system-reminder>\n<total_tokens>150 tokens left</total_tokens>\n</system-reminder>"}],"renderedRole":"system","timestamp":"2025-06-26T10:00:00Z","sessionId":"session-1"}"#,
+            r#"{"type":"api-request-blob","hash":"h1","message":{"role":"system","content":"<total_tokens>150 tokens left</total_tokens>"},"timestamp":"2025-06-26T10:00:00Z","sessionId":"session-1"}"#,
+            r#"{"type":"api-request","id":"req-1","timestamp":"2025-06-26T10:00:00Z","sessionId":"session-1"}"#
+        );
+
+        let file_path = temp_dir.path().join("test.jsonl");
+        std::fs::write(&file_path, content).unwrap();
+
+        let result = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message_count, 2);
     }
 }
